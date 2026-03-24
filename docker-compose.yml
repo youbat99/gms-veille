@@ -1,0 +1,43 @@
+version: "3.9"
+
+# ══════════════════════════════════════════════════════════════════════
+# GMS Veille Média — Docker Compose (test local avant déploiement)
+#
+# Usage :
+#   docker compose up --build        → démarrer tout
+#   docker compose up backend        → backend seulement
+#   docker compose down              → tout arrêter
+#   docker compose logs -f backend   → voir les logs
+# ══════════════════════════════════════════════════════════════════════
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      - FRONTEND_URL=http://localhost:3000
+    volumes:
+      # Mount du code pour voir les changements sans rebuild (optionnel)
+      - ./backend:/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Décommente si tu veux un Redis local
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   restart: unless-stopped
+
+# Note : le frontend Next.js se lance en local avec "npm run dev"
+# En production il est sur Vercel (pas besoin de Docker pour le frontend)

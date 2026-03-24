@@ -1,0 +1,62 @@
+# ── Python ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.eggs/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Variables d'environnement (JAMAIS commiter) ─────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── Node / Next.js ──────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+.pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+
+# ── OS ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.tsbuildinfo
+
+# ── Éditeurs ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Docker ──────────────────────────────────────────────────────────────
+*.log
+
+# ── Playwright ──────────────────────────────────────────────────────────
+test-results/
+playwright-report/
+
+# ── Vercel ──────────────────────────────────────────────────────────────
+.vercel
+
+# ── Données locales / exports ───────────────────────────────────────────
+*.csv
+*.xlsx
+exports/

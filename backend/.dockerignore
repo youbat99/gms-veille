@@ -1,0 +1,43 @@
+# Ne pas inclure dans l'image Docker
+
+# Environnement virtuel local
+.venv/
+venv/
+env/
+
+# Fichiers secrets (les vrais sont injectés via variables d'env Coolify)
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Tests
+tests/
+coverage/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Éditeurs
+.vscode/
+.idea/
+*.swp
+
+# Git
+.git/
+.gitignore
+
+# Docs
+*.md
