@@ -556,8 +556,275 @@ async def detect_rss(url: str) -> dict | None:
             except Exception:
                 pass
 
-        # 5. Fallback → Playwright (scraping direct de la homepage)
+        # 5. BeautifulSoup — requête HTTP simple, pas besoin de JS
+        bs_result = await _detect_via_requests(session, base_url)
+        if bs_result:
+            return bs_result
+
+        # 6. FlareSolverr — site Cloudflare protégé
+        flare_result = await _detect_via_flaresolverr(base_url)
+        if flare_result:
+            return flare_result
+
+        # 7. Fallback → Playwright (SPA React/Vue, dernier recours)
         return {"rss_url": base_url, "rss_type": "playwright", "crawl_method": "playwright"}
+
+
+_ARTICLE_URL_RE = re.compile(
+    r'/(\d{4})/(\d{2})/(\d{2})/|'       # /2026/03/27/
+    r'/(\d{4})-(\d{2})-(\d{2})/|'       # /2026-03-27/
+    r'/article[s]?/|/news/|/actu/|'     # segments courants
+    r'/post[s]?/|/actualit|/fil-info',
+    re.IGNORECASE,
+)
+
+_CLOUDFLARE_RE = re.compile(
+    r'checking your browser|just a moment|cf-browser-verification|'
+    r'enable javascript|cloudflare ray id',
+    re.IGNORECASE,
+)
+
+_SPA_RE = re.compile(
+    r'<div\s+id=["\'](?:root|app|__next)["\']>\s*</div>|'
+    r'<div\s+id=["\'](?:root|app|__next)["\']/>',
+    re.IGNORECASE,
+)
+
+
+def _extract_date_from_url(url: str):
+    """Extrait une date depuis l'URL si elle contient /YYYY/MM/DD/ ou /YYYY-MM-DD/."""
+    from datetime import timezone as _tz
+    m = re.search(r'/(\d{4})[/-](\d{2})[/-](\d{2})/', url)
+    if m:
+        try:
+            from datetime import datetime as _dt
+            return _dt(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=_tz.utc)
+        except Exception:
+            pass
+    return None
+
+
+async def _detect_via_requests(
+    session: aiohttp.ClientSession, base_url: str
+) -> dict | None:
+    """
+    Étape 5 de detect_rss : teste si le site répond en HTML statique exploitable.
+    Retourne crawl_method='requests' si OK, None sinon.
+    """
+    try:
+        async with session.get(
+            base_url, timeout=aiohttp.ClientTimeout(total=10),
+            headers=HEADERS, ssl=False, allow_redirects=True
+        ) as resp:
+            if resp.status in (403, 503, 429):
+                return None
+            if resp.status != 200:
+                return None
+            html = await resp.text(errors="replace")
+
+        if not html or len(html) < 500:
+            return None
+
+        # SPA React/Vue vide → Playwright nécessaire
+        if _SPA_RE.search(html):
+            return None
+
+        # Cloudflare challenge → FlareSolverr
+        if _CLOUDFLARE_RE.search(html):
+            return None
+
+        # Site HTML statique exploitable : pas SPA, pas Cloudflare, répond 200
+        # → on classe directement en "requests", le crawleur extraira ce qu'il peut
+        # (on n'exige plus de patterns d'URL spécifiques — trop restrictif pour les sites MA)
+        return {"rss_url": base_url, "rss_type": "html", "crawl_method": "requests"}
+
+    except Exception:
+        pass
+    return None
+
+
+async def _detect_via_flaresolverr(base_url: str) -> dict | None:
+    """
+    Étape 6 de detect_rss : tente de bypasser Cloudflare via FlareSolverr local.
+    Retourne crawl_method='flaresolverr' si OK, None sinon.
+    """
+    from app.core.config import settings
+    flare_url = getattr(settings, "FLARESOLVERR_URL", "http://localhost:8191")
+    if not flare_url:
+        return None
+    try:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as s:
+            async with s.post(
+                f"{flare_url}/v1",
+                json={"cmd": "request.get", "url": base_url, "maxTimeout": 20000},
+                timeout=aiohttp.ClientTimeout(total=25),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if data.get("status") != "ok":
+                    return None
+                html = data.get("solution", {}).get("response", "")
+                if not html or len(html) < 500:
+                    return None
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(html, "html.parser")
+                links = [
+                    a["href"] for a in soup.find_all("a", href=True)
+                    if _ARTICLE_URL_RE.search(a["href"])
+                ]
+                if len(links) >= 3:
+                    return {"rss_url": base_url, "rss_type": "html", "crawl_method": "flaresolverr"}
+    except Exception:
+        pass
+    return None
+
+
+async def crawl_source_requests(
+    session: aiohttp.ClientSession, source: "MediaSource"
+) -> list[dict]:
+    """
+    Crawle une source via requête HTTP simple + BeautifulSoup.
+    Extrait les liens d'articles depuis la homepage, filtre par date (max 48h).
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from bs4 import BeautifulSoup
+
+    cutoff = _dt.now(_tz.utc) - _td(hours=48)
+    articles = []
+
+    try:
+        async with session.get(
+            source.base_url, timeout=aiohttp.ClientTimeout(total=15),
+            headers=HEADERS, ssl=False, allow_redirects=True
+        ) as resp:
+            if resp.status != 200:
+                return []
+            html = await resp.text(errors="replace")
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith("#") or href.startswith("mailto:"):
+            continue
+
+        # URL absolue
+        if href.startswith("/"):
+            href = source.base_url.rstrip("/") + href
+        elif not href.startswith("http"):
+            continue
+
+        # Doit ressembler à un article
+        if not _ARTICLE_URL_RE.search(href):
+            continue
+
+        # Déduplique
+        url_hash = make_hash(href)
+        if url_hash in seen:
+            continue
+        seen.add(url_hash)
+
+        # Date depuis l'URL
+        pub_date = _extract_date_from_url(href)
+
+        # Filtre 48h si date trouvée
+        if pub_date and pub_date < cutoff:
+            continue
+
+        # Titre depuis le texte du lien ou balise parente
+        title = a.get_text(strip=True)
+        if not title:
+            parent = a.find_parent(["h1", "h2", "h3", "h4", "article"])
+            if parent:
+                title = parent.get_text(strip=True)[:200]
+
+        articles.append({
+            "url": href,
+            "url_hash": url_hash,
+            "rss_title": title[:500] if title else None,
+            "rss_pub_date": pub_date,
+            "rss_image": None,
+        })
+
+    return articles[:50]  # max 50 articles par crawl
+
+
+async def crawl_source_flaresolverr(source: "MediaSource") -> list[dict]:
+    """
+    Crawle une source protégée Cloudflare via FlareSolverr.
+    Même logique que crawl_source_requests mais via le proxy local.
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from bs4 import BeautifulSoup
+    from app.core.config import settings
+
+    flare_url = getattr(settings, "FLARESOLVERR_URL", "http://localhost:8191")
+    cutoff = _dt.now(_tz.utc) - _td(hours=48)
+    articles = []
+
+    try:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as s:
+            async with s.post(
+                f"{flare_url}/v1",
+                json={"cmd": "request.get", "url": source.base_url, "maxTimeout": 20000},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+                if data.get("status") != "ok":
+                    return []
+                html = data.get("solution", {}).get("response", "")
+    except Exception:
+        return []
+
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith("#") or href.startswith("mailto:"):
+            continue
+        if href.startswith("/"):
+            href = source.base_url.rstrip("/") + href
+        elif not href.startswith("http"):
+            continue
+        if not _ARTICLE_URL_RE.search(href):
+            continue
+
+        url_hash = make_hash(href)
+        if url_hash in seen:
+            continue
+        seen.add(url_hash)
+
+        pub_date = _extract_date_from_url(href)
+        if pub_date and pub_date < cutoff:
+            continue
+
+        title = a.get_text(strip=True)
+        if not title:
+            parent = a.find_parent(["h1", "h2", "h3", "h4", "article"])
+            if parent:
+                title = parent.get_text(strip=True)[:200]
+
+        articles.append({
+            "url": href,
+            "url_hash": url_hash,
+            "rss_title": title[:500] if title else None,
+            "rss_pub_date": pub_date,
+            "rss_image": None,
+        })
+
+    return articles[:50]
 
 
 async def _fetch_og(session: aiohttp.ClientSession, url: str) -> dict:
@@ -950,10 +1217,16 @@ async def _crawl_and_save(db: AsyncSession, source: "MediaSource") -> dict:
 
     if method == "playwright":
         articles = await crawl_source_playwright(source)
+    elif method == "flaresolverr":
+        articles = await crawl_source_flaresolverr(source)
     elif method == "sitemap":
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as http_session:
             articles = await crawl_source_sitemap(http_session, source)
+    elif method == "requests":
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as http_session:
+            articles = await crawl_source_requests(http_session, source)
     else:
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as http_session:
@@ -985,6 +1258,31 @@ async def _crawl_and_save(db: AsyncSession, source: "MediaSource") -> dict:
             stats["duplicates"] += 1
 
     source.last_crawled_at = datetime.now(timezone.utc)
+
+    # Mise à jour du score adaptatif (articles/jour sur 30 derniers jours)
+    try:
+        from datetime import timedelta as _td
+        from sqlalchemy import func as _func
+        cutoff_30 = datetime.now(timezone.utc) - _td(days=30)
+        count_result = await db.execute(
+            select(_func.count(RssArticle.id))
+            .where(RssArticle.source_id == source.id)
+            .where(RssArticle.created_at >= cutoff_30)
+        )
+        total_30d = count_result.scalar() or 0
+        apd = round(total_30d / 30, 2)
+        source.articles_per_day = apd
+        if apd >= 10:
+            source.crawl_interval_minutes = 60
+        elif apd >= 3:
+            source.crawl_interval_minutes = 180
+        elif apd >= 0.5:
+            source.crawl_interval_minutes = 720
+        else:
+            source.crawl_interval_minutes = 1440
+    except Exception:
+        pass
+
     db.add(SourceCrawlLog(
         source_id=source.id,
         trigger="rolling",
@@ -1137,6 +1435,19 @@ async def enrich_pending_batch(db: AsyncSession, batch_size: int = 5) -> dict:
                     t = _html.unescape(enrichment["title"]).strip()
                     t_clean = re.sub(r'\s*[-|]\s*[^-|]{3,60}$', '', t).strip()
                     art.title = (t_clean or t)[:1024]
+
+                # Détection page 404 / erreur — titre typique des pages d'erreur
+                _404_PATTERNS = (
+                    "غير موجودة", "الصفحة غير", "page not found", "404",
+                    "introuvable", "not found", "page introuvable",
+                    "error 404", "خطأ 404", "لا توجد", "page doesn't exist",
+                )
+                if art.title and any(p in art.title.lower() for p in _404_PATTERNS):
+                    art.status = "failed"
+                    art.extraction_error = "page_404"
+                    art.retry_after = None  # pas de retry — URL morte
+                    art.enriched_at = datetime.now(timezone.utc)
+                    return
 
                 # Texte complet nettoyé
                 if enrichment.get("content"):
