@@ -42,6 +42,8 @@ async def _run_rss_crawl() -> None:
 
 # Lock pour éviter les exécutions concurrentes des workers
 _crawl_lock = asyncio.Lock()
+_crawl_bs_lock = asyncio.Lock()
+_crawl_pw_lock = asyncio.Lock()
 _enrich_lock = asyncio.Lock()
 _match_lock = asyncio.Lock()
 _gdelt_lock = asyncio.Lock()
@@ -51,33 +53,50 @@ _purge_lock = asyncio.Lock()
 _clustering_lock = asyncio.Lock()
 
 
-_RSS_PARALLEL = 3   # sources crawlées simultanément par tick (209 sources → cycle ~12 min)
+def _is_daytime() -> bool:
+    """True entre 06h et 22h (heure serveur UTC+1 Maroc)."""
+    from datetime import timezone as _tz
+    hour = datetime.now(_tz.utc).hour + 1  # UTC+1
+    return 6 <= hour < 22
 
 
-async def _run_rss_rolling_crawl() -> None:
-    """Rolling crawl parallèle : crawle les N sources les plus anciennes simultanément."""
-    if _crawl_lock.locked():
-        return  # Déjà en cours, on saute ce tick
-    async with _crawl_lock:
+async def _rolling_crawl(
+    lock: asyncio.Lock,
+    methods: list[str],
+    parallel: int,
+    label: str,
+) -> None:
+    """Generic rolling crawl : prend les N sources les plus anciennes parmi les méthodes données,
+    en respectant leur crawl_interval_minutes adaptatif."""
+    if lock.locked():
+        return
+    async with lock:
         from app.core.database import AsyncSessionLocal
         from app.services.rss_service import crawl_source_by_id
-        from sqlalchemy import select, update as sa_update
+        from sqlalchemy import select, update as sa_update, text as sa_text
         from app.models.media_source import MediaSource
+        from datetime import timedelta
 
-        # 1. Réserver N sources atomiquement (mise à jour préventive de last_crawled_at
-        #    pour éviter qu'un second tick les re-sélectionne avant la fin du crawl)
         try:
             async with AsyncSessionLocal() as db:
+                now = datetime.now(timezone.utc)
                 result = await db.execute(
                     select(MediaSource.id)
-                    .where(MediaSource.is_active == True)
+                    .where(
+                        MediaSource.is_active == True,
+                        MediaSource.crawl_method.in_(methods),
+                        # Respecte l'intervalle adaptatif
+                        sa_text(
+                            "last_crawled_at IS NULL OR "
+                            "last_crawled_at < NOW() - (crawl_interval_minutes * interval '1 minute')"
+                        ),
+                    )
                     .order_by(MediaSource.last_crawled_at.asc().nullsfirst())
-                    .limit(_RSS_PARALLEL)
+                    .limit(parallel)
                 )
                 source_ids = [row[0] for row in result.all()]
                 if not source_ids:
                     return
-                now = datetime.now(timezone.utc)
                 await db.execute(
                     sa_update(MediaSource)
                     .where(MediaSource.id.in_(source_ids))
@@ -85,25 +104,44 @@ async def _run_rss_rolling_crawl() -> None:
                 )
                 await db.commit()
         except Exception as e:
-            logger.error(f"[rss:rolling] erreur réservation sources : {e}")
+            logger.error(f"[{label}] erreur réservation : {e}")
             return
 
-        # 2. Crawler chaque source dans sa propre session DB (vrai parallèle)
         async def _one(source_id):
             try:
                 async with AsyncSessionLocal() as db:
                     return await crawl_source_by_id(source_id, db)
             except Exception as e:
-                logger.error(f"[rss:rolling] erreur source {source_id} : {e}")
+                logger.error(f"[{label}] erreur source {source_id} : {e}")
                 return {}
 
         results = await asyncio.gather(*[_one(sid) for sid in source_ids])
         for stats in results:
             if stats and stats.get("saved", 0) > 0:
                 logger.info(
-                    f"[rss:rolling] {stats['source']} → +{stats['saved']} articles "
+                    f"[{label}] {stats['source']} → +{stats['saved']} articles "
                     f"({stats.get('duplicates', 0)} dupli.)"
                 )
+
+
+async def _run_rss_rolling_crawl() -> None:
+    """RSS + Sitemap — toute la journée, tick 10s, 5 en parallèle."""
+    await _rolling_crawl(_crawl_lock, ["rss", "sitemap"], 5, "rss:rolling")
+
+
+async def _run_bs_rolling_crawl() -> None:
+    """BeautifulSoup + FlareSolverr — 06h-22h uniquement, tick 30s, 3 en parallèle."""
+    if not _is_daytime():
+        return
+    await _rolling_crawl(_crawl_bs_lock, ["requests", "flaresolverr"], 3, "bs:rolling")
+
+
+async def _run_playwright_night_crawl() -> None:
+    """Playwright — 1 source à la fois, nuit seulement (03h-06h)."""
+    hour = (datetime.now(timezone.utc).hour + 1) % 24  # UTC+1
+    if not (3 <= hour < 6):
+        return
+    await _rolling_crawl(_crawl_pw_lock, ["playwright"], 1, "pw:night")
 
 
 async def _run_rss_enrich_worker() -> None:
@@ -171,6 +209,75 @@ async def _run_clustering_worker() -> None:
                     )
         except Exception as e:
             logger.error(f"[clustering] erreur : {e}")
+
+
+async def _run_source_health_check() -> None:
+    """
+    Teste chaque nuit 31 sources inactives (1860 / 60 jours).
+    Si répond → réactivée. Si +60 jours → permanently_dead = True.
+    """
+    from app.core.database import AsyncSessionLocal
+    from app.services.rss_service import detect_rss
+    from app.models.media_source import MediaSource
+    from sqlalchemy import select, update as sa_update
+    from datetime import timedelta
+
+    BATCH = 31
+    DEAD_AFTER_DAYS = 60
+
+    try:
+        async with AsyncSessionLocal() as db:
+            now = datetime.now(timezone.utc)
+            # Marquer définitivement mortes celles qui dépassent 60 jours
+            await db.execute(
+                sa_update(MediaSource)
+                .where(
+                    MediaSource.is_active == False,
+                    MediaSource.permanently_dead == False,
+                    MediaSource.deactivated_at <= now - timedelta(days=DEAD_AFTER_DAYS),
+                )
+                .values(permanently_dead=True)
+            )
+            await db.commit()
+
+            # Prendre le prochain batch à tester
+            result = await db.execute(
+                select(MediaSource)
+                .where(MediaSource.is_active == False, MediaSource.permanently_dead == False)
+                .order_by(MediaSource.deactivated_at.asc().nullsfirst())
+                .limit(BATCH)
+            )
+            sources = result.scalars().all()
+
+        reactivated = 0
+        for source in sources:
+            try:
+                detected = await asyncio.wait_for(detect_rss(source.base_url), timeout=15)
+                if detected and detected.get("rss_type") != "playwright":
+                    async with AsyncSessionLocal() as db:
+                        await db.execute(
+                            sa_update(MediaSource)
+                            .where(MediaSource.id == source.id)
+                            .values(
+                                is_active=True,
+                                deactivated_at=None,
+                                permanently_dead=False,
+                                rss_url=detected["rss_url"],
+                                rss_type=detected["rss_type"],
+                                crawl_method=detected["crawl_method"],
+                            )
+                        )
+                        await db.commit()
+                    reactivated += 1
+                    logger.info(f"[health_check] ✅ réactivée : {source.name} ({detected['crawl_method']})")
+            except Exception:
+                pass
+
+        if reactivated or sources:
+            logger.info(f"[health_check] {reactivated}/{len(sources)} sources réactivées cette nuit")
+
+    except Exception as e:
+        logger.error(f"[health_check] erreur : {e}")
 
 
 async def _run_purge_worker() -> None:
@@ -590,12 +697,29 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"[scheduler] erreur chargement créneaux: {e}")
 
-    # ── Rolling crawl RSS ──────────────────────────────────────────────
-    # Une source crawlée toutes les 10s → cycle complet ~10-27 min selon nb sources
+    # ── Rolling crawl RSS/Sitemap — toute la journée, tick 10s ────────
     _scheduler.add_job(
         _run_rss_rolling_crawl,
         IntervalTrigger(seconds=10, timezone=TZ),
         id="rss_rolling_crawl",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # ── Rolling crawl BS/FlareSolverr — 06h-22h, tick 30s ─────────────
+    _scheduler.add_job(
+        _run_bs_rolling_crawl,
+        IntervalTrigger(seconds=30, timezone=TZ),
+        id="bs_rolling_crawl",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # ── Playwright nocturne — 03h-06h, tick 60s, 1 à la fois ──────────
+    _scheduler.add_job(
+        _run_playwright_night_crawl,
+        IntervalTrigger(seconds=60, timezone=TZ),
+        id="playwright_night_crawl",
         replace_existing=True,
         max_instances=1,
     )
@@ -642,6 +766,15 @@ async def lifespan(app: FastAPI):
         _run_purge_worker,
         CronTrigger(hour=3, minute=0, timezone=TZ),
         id="purge_worker",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # Health check noctune — teste 31 sources inactives/nuit (cycle 60 jours)
+    _scheduler.add_job(
+        _run_source_health_check,
+        CronTrigger(hour=4, minute=30, timezone=TZ),
+        id="source_health_check",
         replace_existing=True,
         max_instances=1,
     )
