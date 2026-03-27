@@ -967,17 +967,22 @@ async def _crawl_and_save(db: AsyncSession, source: "MediaSource") -> dict:
         if existing.scalar_one_or_none():
             stats["duplicates"] += 1
             continue
-        db.add(RssArticle(
-            source_id=source.id,
-            url=art["url"],
-            url_hash=art["url_hash"],
-            collection_method=method,
-            status="pending",
-            title=art.get("rss_title"),
-            image_url=art.get("rss_image"),
-            published_at=art.get("rss_pub_date"),
-        ))
-        stats["saved"] += 1
+        try:
+            db.add(RssArticle(
+                source_id=source.id,
+                url=art["url"],
+                url_hash=art["url_hash"],
+                collection_method=method,
+                status="pending",
+                title=art.get("rss_title"),
+                image_url=art.get("rss_image"),
+                published_at=art.get("rss_pub_date"),
+            ))
+            await db.flush()
+            stats["saved"] += 1
+        except Exception:
+            await db.rollback()
+            stats["duplicates"] += 1
 
     source.last_crawled_at = datetime.now(timezone.utc)
     db.add(SourceCrawlLog(
@@ -1363,18 +1368,24 @@ async def crawl_all_sources(db: AsyncSession) -> dict:
                 stats["duplicates"] += 1
                 source_dupes += 1
                 continue
-            db.add(RssArticle(
-                source_id=source.id,
-                url=art["url"],
-                url_hash=art["url_hash"],
-                collection_method=collection_method,
-                status="pending",
-                title=art.get("rss_title"),
-                image_url=art.get("rss_image"),
-                published_at=art.get("rss_pub_date"),
-            ))
-            stats["saved"] += 1
-            source_new += 1
+            try:
+                db.add(RssArticle(
+                    source_id=source.id,
+                    url=art["url"],
+                    url_hash=art["url_hash"],
+                    collection_method=collection_method,
+                    status="pending",
+                    title=art.get("rss_title"),
+                    image_url=art.get("rss_image"),
+                    published_at=art.get("rss_pub_date"),
+                ))
+                await db.flush()
+                stats["saved"] += 1
+                source_new += 1
+            except Exception:
+                await db.rollback()
+                stats["duplicates"] += 1
+                source_dupes += 1
         source.last_crawled_at = datetime.now(timezone.utc)
         # Log du crawl par source
         db.add(SourceCrawlLog(

@@ -23,7 +23,7 @@ def _health_status(last_crawled_at: datetime | None, last_collected_at: datetime
     """Calcule le statut de santé d'une source : ok | warning | critical."""
     now = datetime.now(timezone.utc)
     if last_crawled_at is None:
-        return "critical"
+        return "new"
     crawled_ago = (now - last_crawled_at.replace(tzinfo=timezone.utc) if last_crawled_at.tzinfo is None else now - last_crawled_at).total_seconds() / 3600
     if crawled_ago > 24:
         return "critical"
