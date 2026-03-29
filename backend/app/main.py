@@ -125,8 +125,8 @@ async def _rolling_crawl(
 
 
 async def _run_rss_rolling_crawl() -> None:
-    """RSS + Sitemap — toute la journée, tick 10s, 5 en parallèle."""
-    await _rolling_crawl(_crawl_lock, ["rss", "sitemap"], 5, "rss:rolling")
+    """RSS + Sitemap — toute la journée, tick 10s, 10 en parallèle."""
+    await _rolling_crawl(_crawl_lock, ["rss", "sitemap"], 10, "rss:rolling")
 
 
 async def _run_bs_rolling_crawl() -> None:
@@ -153,11 +153,37 @@ async def _run_rss_enrich_worker() -> None:
         from app.services.rss_service import enrich_pending_batch
         try:
             async with AsyncSessionLocal() as db:
-                stats = await enrich_pending_batch(db, batch_size=8)
+                stats = await enrich_pending_batch(db, batch_size=20)
                 if stats.get("enriched", 0) > 0:
                     logger.info(f"[rss:enrich] {stats['enriched']} articles enrichis")
         except Exception as e:
             logger.error(f"[rss:enrich] erreur : {e}")
+
+async def _run_expire_old_pending() -> None:
+    """Expire les articles pending de plus de 3 jours — ne seront jamais enrichis."""
+    from app.core.database import AsyncSessionLocal
+    from app.models.rss_article import RssArticle
+    from sqlalchemy import update
+    from datetime import timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                update(RssArticle)
+                .where(RssArticle.status == "pending")
+                .where(RssArticle.collected_at < cutoff)
+                .values(
+                    status="failed",
+                    extraction_error="too_old",
+                    retry_after=None,
+                )
+            )
+            await db.commit()
+            count = result.rowcount
+            if count:
+                logger.info(f"[purge:too_old] {count} articles pending expirés (> 3 jours)")
+    except Exception as e:
+        logger.error(f"[purge:too_old] erreur : {e}")
 
 async def _run_rss_match_worker() -> None:
     """Worker de matching : RSS articles → keywords → articles pending."""
@@ -724,11 +750,20 @@ async def lifespan(app: FastAPI):
         max_instances=1,
     )
 
-    # Worker d'enrichissement trafilatura — batch de 8 articles toutes les 20s
+    # Worker d'enrichissement — batch 20 articles toutes les 10s (Traf+Jina)
     _scheduler.add_job(
         _run_rss_enrich_worker,
-        IntervalTrigger(seconds=20, timezone=TZ),
+        IntervalTrigger(seconds=10, timezone=TZ),
         id="rss_enrich_worker",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # Purge articles pending > 3 jours — toutes les heures
+    _scheduler.add_job(
+        _run_expire_old_pending,
+        IntervalTrigger(hours=1, timezone=TZ),
+        id="expire_old_pending",
         replace_existing=True,
         max_instances=1,
     )
@@ -752,14 +787,14 @@ async def lifespan(app: FastAPI):
         max_instances=1,
     )
 
-    # Clustering d'articles similaires — toutes les 30min
-    _scheduler.add_job(
-        _run_clustering_worker,
-        IntervalTrigger(minutes=30, timezone=TZ),
-        id="clustering_worker",
-        replace_existing=True,
-        max_instances=1,
-    )
+    # Clustering désactivé
+    # _scheduler.add_job(
+    #     _run_clustering_worker,
+    #     IntervalTrigger(minutes=30, timezone=TZ),
+    #     id="clustering_worker",
+    #     replace_existing=True,
+    #     max_instances=1,
+    # )
 
     # Purge quotidienne — supprime no_match et failed définitifs (+30 jours)
     _scheduler.add_job(

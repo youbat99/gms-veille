@@ -332,6 +332,29 @@ async def match_rss_batch(db: AsyncSession, batch_size: int = 50) -> dict:
             if "news.google.com" in rss.url:
                 continue
 
+            # Bloquer les titres d'erreur / captcha / réseaux sociaux
+            _title_low = (rss.title or "").lower().strip()
+            _BAD_TITLES = (
+                "غير موجودة", "الصفحة غير", "page not found", "404",
+                "introuvable", "not found", "un instant", "just a moment",
+                "please wait", "attention required", "access denied", "forbidden",
+                "instagram", "facebook", "twitter", "tiktok",
+            )
+            if len(_title_low) < 5 or any(p in _title_low for p in _BAD_TITLES):
+                continue
+
+            # Vérification DB avant insert — évite les doublons en race condition
+            if (rss.url, rid) in existing_set:
+                continue
+            dup_check = await db.execute(
+                select(Article.id)
+                .where(Article.url == rss.url, Article.revue_id == best_revue.id)
+                .limit(1)
+            )
+            if dup_check.scalar_one_or_none():
+                existing_set.add((rss.url, rid))
+                continue
+
             source_domain = urlparse(rss.url).netloc.lstrip("www.")
             article = Article(
                 revue_id=best_revue.id,
@@ -441,6 +464,15 @@ async def match_rss_for_revue_recent(
             score = _score_text(rss.title, rss.summary, keyword, rss.content)
             if score < MIN_SCORE:
                 continue
+            # Vérification DB avant insert — évite les doublons en race condition
+            dup = await db.execute(
+                select(Article.id)
+                .where(Article.url == rss.url, Article.revue_id == revue.id)
+                .limit(1)
+            )
+            if dup.scalar_one_or_none():
+                existing_urls.add(rss.url)
+                break
             source_domain = _urlparse(rss.url).netloc.lstrip("www.")
             db.add(Article(
                 revue_id=revue.id, keyword_id=keyword.id,
@@ -478,11 +510,20 @@ async def match_rss_for_revue_recent(
             score = _score_text(art.title, art.summary, keyword, art.content)
             if score < MIN_SCORE:
                 continue
+            # Vérification DB avant insert — évite les doublons en race condition
+            dup = await db.execute(
+                select(Article.id)
+                .where(Article.url == art.url, Article.revue_id == revue.id)
+                .limit(1)
+            )
+            if dup.scalar_one_or_none():
+                existing_urls.add(art.url)
+                break
             source_domain = _urlparse(art.url).netloc.lstrip("www.")
             db.add(Article(
                 revue_id=revue.id, keyword_id=keyword.id,
                 url=art.url, source_domain=source_domain,
-                collection_method=art.collection_method,  # propage la méthode de l'article source
+                collection_method=art.collection_method,
                 status=ArticleStatus.pending,
                 title=art.title, content=art.content,
                 image_url=art.image_url, author=art.author,

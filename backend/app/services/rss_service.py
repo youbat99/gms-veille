@@ -275,87 +275,89 @@ async def _resolve_google_news_url(url: str) -> str:
     return url
 
 
+_LISTING_RE = re.compile(
+    r"/(categor[yi]e?s?|tags?|auteur|author|authors?|archive[ds]?|"
+    r"search|recherche|rubrique|dossier|page/\d|label|topic|section|"
+    r"الاقتصاد|السياسة|المجتمع|الرياضة|الثقافة|العالم)(/|$)",
+    re.IGNORECASE,
+)
+
+def _is_listing_url(url: str) -> bool:
+    """Retourne True si l'URL est une page listing (catégorie, tag, homepage…)."""
+    try:
+        path = urlparse(url).path
+        segments = [s for s in path.split("/") if s]
+        if len(segments) <= 1:
+            return True  # homepage ou chemin trop court
+        return bool(_LISTING_RE.search(path))
+    except Exception:
+        return False
+
+
+async def _fetch_via_jina(url: str, timeout: float = 12.0) -> dict:
+    """Extraction via Jina AI Reader — gère JS, Cloudflare, arabe."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://r.jina.ai/{url}",
+                headers={"Accept": "application/json", "X-Return-Format": "markdown"},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json(content_type=None)
+                    d = data.get("data", {})
+                    return {
+                        "title":   d.get("title", ""),
+                        "content": d.get("content", ""),
+                    }
+    except Exception:
+        pass
+    return {}
+
+
 async def enrich_article(url: str, language: str = "ar") -> dict:
     """
-    Extrait le contenu d'un article selon la langue de la source :
-    - AR → Trafilatura (meilleur support arabe)  avec fallback Newspaper4k
-    - FR/EN → Newspaper4k (texte plus propre)    avec fallback Trafilatura
-    - Si les deux échouent (ex: Cloudflare) → FlareSolverr (si configuré)
+    Pipeline optimisé 2 tiers :
+    - Tier 1 : Trafilatura (10s timeout strict) — rapide, 0 dépendance externe
+    - Tier 2 : Jina AI Reader si Tier 1 échoue — gère JS/Cloudflare/arabe
+
+    Les pages listing/catégorie sont rejetées avant tout fetch HTTP.
     """
     # Résoudre l'URL Google News → URL réelle avant toute extraction
     original_url = url
     if "news.google.com" in url:
         url = await _resolve_google_news_url(url)
 
-    # Fix B — Encoder les caractères non-ASCII (arabe, amazigh, cyrillique…)
-    # Même logique que scraper_service.scrape() — évite HTTP 400 sur URLs arabes
     from app.services.scraper_service import _encode_url as _enc
     url = _enc(url)
 
+    # Rejeter les pages listing avant tout HTTP
+    if _is_listing_url(url):
+        return {"_listing": True}
+
     loop = asyncio.get_event_loop()
 
-    if language == "ar":
-        primary, fallback = _traf_fetch_sync, _newspaper_fetch_sync
-    else:
-        primary, fallback = _newspaper_fetch_sync, _traf_fetch_sync
-
+    # ── Tier 1 : Trafilatura (10s) ────────────────────────────────────────────
+    result: dict = {}
     try:
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, primary, url),
-            timeout=15.0,
+            loop.run_in_executor(None, _traf_fetch_sync, url),
+            timeout=10.0,
         )
-        # Fallback si le primaire n'a pas extrait le contenu OU le titre
-        if not result.get("content") or not result.get("title"):
-            fallback_result = await asyncio.wait_for(
-                loop.run_in_executor(None, fallback, url),
-                timeout=12.0,
-            )
-            if not result.get("title") and fallback_result.get("title"):
-                result["title"] = fallback_result["title"]
-            if not result.get("content") and fallback_result.get("content"):
-                result["content"] = fallback_result["content"]
-            if not result.get("author") and fallback_result.get("author"):
-                result["author"] = fallback_result["author"]
-            if not result.get("image_url") and fallback_result.get("image_url"):
-                result["image_url"] = fallback_result["image_url"]
-
-        # Fallback Playwright si toujours pas de contenu (site JS-rendered : React, Next.js…)
-        if not result.get("content"):
-            from app.services.scraper_service import scraper_service
-            pw_result = await scraper_service._scrape_playwright(url, language)
-            if pw_result.success:
-                if not result.get("title") and pw_result.title:
-                    result["title"] = pw_result.title
-                if pw_result.content:
-                    result["content"] = pw_result.content
-                if not result.get("author") and pw_result.author:
-                    result["author"] = pw_result.author
-                if not result.get("image_url") and pw_result.image_url:
-                    result["image_url"] = pw_result.image_url
-
-        # Fallback FlareSolverr si toujours pas de contenu (Cloudflare bloqué)
-        if not result.get("content"):
-            from app.services.flaresolverr_service import fetch_via_flaresolverr
-            html = await fetch_via_flaresolverr(url)
-            if html:
-                fs_result = _traf_from_html(html)
-                if not result.get("title") and fs_result.get("title"):
-                    result["title"] = fs_result["title"]
-                if fs_result.get("content"):
-                    result["content"] = fs_result["content"]
-                if not result.get("author") and fs_result.get("author"):
-                    result["author"] = fs_result["author"]
-                if not result.get("image_url") and fs_result.get("image_url"):
-                    result["image_url"] = fs_result["image_url"]
-                if fs_result.get("detected_language"):
-                    result["detected_language"] = fs_result["detected_language"]
-
-        # Inclure l'URL résolue si elle a changé (Google News → URL réelle)
-        if url != original_url:
-            result["resolved_url"] = url
-        return result
     except (asyncio.TimeoutError, Exception):
-        return {}
+        result = {}
+
+    # ── Tier 2 : Jina fallback si contenu absent ──────────────────────────────
+    if not result.get("content") or len(result.get("content", "")) < 100:
+        jina = await _fetch_via_jina(url)
+        if jina.get("title") and not result.get("title"):
+            result["title"] = jina["title"]
+        if jina.get("content"):
+            result["content"] = jina["content"]
+
+    if url != original_url:
+        result["resolved_url"] = url
+    return result
 
 
 def extract_image(entry) -> str | None:
@@ -398,18 +400,32 @@ def get_base_url(url: str) -> str:
 
 
 def parse_date(entry) -> datetime | None:
+    now_utc = datetime.now(timezone.utc)
     for field in ("published_parsed", "updated_parsed"):
         val = getattr(entry, field, None)
         if val:
             try:
-                return datetime(*val[:6])
+                d = datetime(*val[:6], tzinfo=timezone.utc)
+                # Rejeter les dates futures (> 1h) ou trop anciennes (> 2 ans) → corrompues
+                if d > now_utc + timedelta(hours=1):
+                    continue
+                if d < now_utc - timedelta(days=730):
+                    continue
+                return d
             except Exception:
                 pass
     for field in ("published", "updated"):
         val = getattr(entry, field, None)
         if val:
             try:
-                return parsedate_to_datetime(val)
+                d = parsedate_to_datetime(val)
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=timezone.utc)
+                if d > now_utc + timedelta(hours=1):
+                    continue
+                if d < now_utc - timedelta(days=730):
+                    continue
+                return d
             except Exception:
                 pass
     return None
@@ -1277,9 +1293,9 @@ async def _crawl_and_save(db: AsyncSession, source: "MediaSource") -> dict:
         elif apd >= 3:
             source.crawl_interval_minutes = 180
         elif apd >= 0.5:
-            source.crawl_interval_minutes = 720
+            source.crawl_interval_minutes = 360
         else:
-            source.crawl_interval_minutes = 1440
+            source.crawl_interval_minutes = 360
     except Exception:
         pass
 
@@ -1415,6 +1431,14 @@ async def enrich_pending_batch(db: AsyncSession, batch_size: int = 5) -> dict:
                     art.url = enrichment["resolved_url"]
                     art.url_hash = new_hash
 
+                # Page listing détectée — rejeter immédiatement
+                if enrichment.get("_listing"):
+                    art.status = "failed"
+                    art.extraction_error = "listing_page"
+                    art.retry_after = None
+                    art.enriched_at = datetime.now(timezone.utc)
+                    return
+
                 if not enrichment.get("content") and not enrichment.get("title"):
                     # Rien extrait — marquer comme failed avec backoff exponentiel
                     art.status = "failed"
@@ -1436,16 +1460,30 @@ async def enrich_pending_batch(db: AsyncSession, batch_size: int = 5) -> dict:
                     t_clean = re.sub(r'\s*[-|]\s*[^-|]{3,60}$', '', t).strip()
                     art.title = (t_clean or t)[:1024]
 
-                # Détection page 404 / erreur — titre typique des pages d'erreur
-                _404_PATTERNS = (
+                # Détection page 404 / erreur / captcha — URL morte, pas de retry
+                _BAD_TITLE_PATTERNS = (
+                    # 404 / page inexistante
                     "غير موجودة", "الصفحة غير", "page not found", "404",
                     "introuvable", "not found", "page introuvable",
                     "error 404", "خطأ 404", "لا توجد", "page doesn't exist",
+                    # Captcha / protection cloudflare
+                    "un instant", "just a moment", "please wait", "attention required",
+                    "vérification", "verification", "checking your browser",
+                    "enable javascript", "ddos protection", "ray id",
+                    # Accès refusé
+                    "access denied", "forbidden", "403 forbidden",
+                    # Réseaux sociaux (liens directs non-articles)
+                    "instagram", "facebook", "twitter", "tiktok",
                 )
-                if art.title and any(p in art.title.lower() for p in _404_PATTERNS):
+                _title_low = (art.title or "").lower().strip()
+                _is_bad = (
+                    any(p in _title_low for p in _BAD_TITLE_PATTERNS)
+                    or len(_title_low) < 5  # titre quasi-vide
+                )
+                if _is_bad:
                     art.status = "failed"
                     art.extraction_error = "page_404"
-                    art.retry_after = None  # pas de retry — URL morte
+                    art.retry_after = None
                     art.enriched_at = datetime.now(timezone.utc)
                     return
 
