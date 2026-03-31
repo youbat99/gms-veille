@@ -384,12 +384,19 @@ def _is_listing_url(url: str) -> bool:
         if len(segments) == 0:
             return True  # homepage pure
         if len(segments) == 1:
-            # Un seul segment = article ID numérique (ex: /1174498, /211165.html, /151147/)
-            # Patterns reconnus comme articles : purement numérique, ou numérique + extension
+            # Un seul segment — patterns d'articles reconnus :
+            # /1174498  /211165.html  /151147/        → purement numérique (± extension)
+            # /467844-cnp-bensaid.html                → numérique + tiret + slug (hespress)
+            # /news-242764.html  /article-123456/     → préfixe + numérique (hibapress, etc.)
             import re as _re
-            if _re.match(r'^\d+(\.\w+)?/?$', segments[0]):
-                return False
-            return True  # chemin non-numérique trop court = listing
+            seg = segments[0]
+            if _re.match(r'^\d+(\.\w+)?/?$', seg):
+                return False  # purement numérique
+            if _re.match(r'^\d{4,}[-_].+', seg):
+                return False  # commence par 4+ chiffres + tiret (ex: 467844-slug.html)
+            if _re.search(r'\d{4,}', seg):
+                return False  # contient 4+ chiffres consécutifs = ID article probable
+            return True  # chemin court sans ID numérique = listing probable
         return bool(_LISTING_RE.search(path))
     except Exception:
         return False
