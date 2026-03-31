@@ -369,41 +369,6 @@ async def _resolve_google_news_url(url: str) -> str:
     return url
 
 
-_LISTING_RE = re.compile(
-    r"/(categor[yi]e?s?|tags?|auteur|author|authors?|archive[ds]?|"
-    r"search|recherche|rubrique|dossier|page/\d|label|topic|section|"
-    r"الاقتصاد|السياسة|المجتمع|الرياضة|الثقافة|العالم)(/|$)",
-    re.IGNORECASE,
-)
-
-def _is_listing_url(url: str) -> bool:
-    """Retourne True si l'URL est une page listing (catégorie, tag, pagination…).
-
-    Stratégie conservatrice : on ne bloque QUE les URLs avec des mots-clés
-    explicites de listing dans le chemin (search, rubrique, page/2, etc.).
-    Une page listing collectée par erreur rentre une seule fois (url_hash unique)
-    puis échoue à l'extraction → bien moins grave qu'un vrai article bloqué.
-    """
-    try:
-        from urllib.parse import parse_qs as _pqs
-        parsed = urlparse(url)
-        path = parsed.path
-        segments = [s for s in path.split("/") if s]
-
-        # Homepage pure sans query params utiles → listing
-        if len(segments) == 0:
-            qs = _pqs(parsed.query)
-            for key in ("p", "page_id", "article", "post", "id"):
-                import re as _re
-                val = qs.get(key, [""])[0]
-                if _re.match(r'^\d+$', val):
-                    return False  # WordPress ?p=ID → article
-            return True
-
-        # Mots-clés explicites de listing dans le chemin
-        return bool(_LISTING_RE.search(path))
-    except Exception:
-        return False
 
 
 async def _fetch_via_jina(url: str, timeout: float = 12.0, css_selector: str | None = None) -> dict:
@@ -447,9 +412,6 @@ async def enrich_article(url: str, language: str = "ar") -> dict:
 
     from app.services.scraper_service import _encode_url as _enc
     url = _enc(url)
-
-    if _is_listing_url(url):
-        return {"_listing": True}
 
     domain = urlparse(url).netloc.lower().replace("www.", "")
     css_selector = _SITE_SELECTORS.get(domain)
@@ -1581,15 +1543,7 @@ async def enrich_pending_batch(db: AsyncSession, batch_size: int = 5) -> dict:
                     art.url = enrichment["resolved_url"]
                     art.url_hash = new_hash
 
-                # Page listing détectée — rejeter immédiatement
-                if enrichment.get("_listing"):
-                    art.status = "failed"
-                    art.extraction_error = "listing_page"
-                    art.retry_after = None
-                    art.enriched_at = datetime.now(timezone.utc)
-                    return
-
-                if not enrichment.get("content") and not enrichment.get("title"):
+if not enrichment.get("content") and not enrichment.get("title"):
                     # Rien extrait — marquer comme failed avec backoff exponentiel
                     art.status = "failed"
                     art.enriched_at = datetime.now(timezone.utc)
