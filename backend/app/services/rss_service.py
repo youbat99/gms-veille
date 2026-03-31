@@ -385,18 +385,29 @@ def _is_listing_url(url: str) -> bool:
             return True  # homepage pure
         if len(segments) == 1:
             # Un seul segment — patterns d'articles reconnus :
-            # /1174498  /211165.html  /151147/        → purement numérique (± extension)
+            # /1174498  /211165.html                  → purement numérique (± extension)
             # /467844-cnp-bensaid.html                → numérique + tiret + slug (hespress)
-            # /news-242764.html  /article-123456/     → préfixe + numérique (hibapress, etc.)
+            # /news-242764.html                       → mot + ID numérique (hibapress)
+            # /69cc0dc5169f6c0001a21e77/              → hash avec 4+ chiffres (alakhbar)
+            # /le-chef-du-pentagone-annonce.html      → long slug latin (atlasinfo)
+            # /%d8%ad%d8%b1%d9%8a%d9%82-...          → slug arabe encodé (wakalatalanbae)
+            from urllib.parse import unquote as _unquote
             import re as _re
             seg = segments[0]
+            decoded = _unquote(seg)
             if _re.match(r'^\d+(\.\w+)?/?$', seg):
                 return False  # purement numérique
             if _re.match(r'^\d{4,}[-_].+', seg):
-                return False  # commence par 4+ chiffres + tiret (ex: 467844-slug.html)
+                return False  # commence par 4+ chiffres + tiret
             if _re.search(r'\d{4,}', seg):
-                return False  # contient 4+ chiffres consécutifs = ID article probable
-            return True  # chemin court sans ID numérique = listing probable
+                return False  # contient 4+ chiffres = ID article probable
+            if seg.count('-') >= 3:
+                return False  # long slug avec tirets = titre d'article
+            if _re.search(r'%[0-9a-fA-F]{2}', seg) and len(seg) > 20:
+                return False  # URL-encoded (slug arabe ou autre) long
+            if _re.search(r'[\u0600-\u06ff]', decoded):
+                return False  # Arabic décodé = article
+            return True  # court, simple, sans ID → listing
         return bool(_LISTING_RE.search(path))
     except Exception:
         return False
