@@ -377,45 +377,30 @@ _LISTING_RE = re.compile(
 )
 
 def _is_listing_url(url: str) -> bool:
-    """Retourne True si l'URL est une page listing (catégorie, tag, homepage…)."""
+    """Retourne True si l'URL est une page listing (catégorie, tag, pagination…).
+
+    Stratégie conservatrice : on ne bloque QUE les URLs avec des mots-clés
+    explicites de listing dans le chemin (search, rubrique, page/2, etc.).
+    Une page listing collectée par erreur rentre une seule fois (url_hash unique)
+    puis échoue à l'extraction → bien moins grave qu'un vrai article bloqué.
+    """
     try:
-        path = urlparse(url).path
+        from urllib.parse import parse_qs as _pqs
+        parsed = urlparse(url)
+        path = parsed.path
         segments = [s for s in path.split("/") if s]
+
+        # Homepage pure sans query params utiles → listing
         if len(segments) == 0:
-            # Vérifier les query params WordPress (?p=ID, ?page_id=ID, ?article=ID)
-            import re as _re
-            from urllib.parse import parse_qs as _pqs, urlparse as _up2
-            qs = _pqs(_up2(url).query)
+            qs = _pqs(parsed.query)
             for key in ("p", "page_id", "article", "post", "id"):
+                import re as _re
                 val = qs.get(key, [""])[0]
                 if _re.match(r'^\d+$', val):
                     return False  # WordPress ?p=ID → article
-            return True  # homepage pure
-        if len(segments) == 1:
-            # Un seul segment — patterns d'articles reconnus :
-            # /1174498  /211165.html                  → purement numérique (± extension)
-            # /467844-cnp-bensaid.html                → numérique + tiret + slug (hespress)
-            # /news-242764.html                       → mot + ID numérique (hibapress)
-            # /69cc0dc5169f6c0001a21e77/              → hash avec 4+ chiffres (alakhbar)
-            # /le-chef-du-pentagone-annonce.html      → long slug latin (atlasinfo)
-            # /%d8%ad%d8%b1%d9%8a%d9%82-...          → slug arabe encodé (wakalatalanbae)
-            from urllib.parse import unquote as _unquote
-            import re as _re
-            seg = segments[0]
-            decoded = _unquote(seg)
-            if _re.match(r'^\d+(\.\w+)?/?$', seg):
-                return False  # purement numérique
-            if _re.match(r'^\d{4,}[-_].+', seg):
-                return False  # commence par 4+ chiffres + tiret
-            if _re.search(r'\d{4,}', seg):
-                return False  # contient 4+ chiffres = ID article probable
-            if seg.count('-') >= 3:
-                return False  # long slug avec tirets = titre d'article
-            if _re.search(r'%[0-9a-fA-F]{2}', seg) and len(seg) > 20:
-                return False  # URL-encoded (slug arabe ou autre) long
-            if _re.search(r'[\u0600-\u06ff]', decoded):
-                return False  # Arabic décodé = article
-            return True  # court, simple, sans ID → listing
+            return True
+
+        # Mots-clés explicites de listing dans le chemin
         return bool(_LISTING_RE.search(path))
     except Exception:
         return False
