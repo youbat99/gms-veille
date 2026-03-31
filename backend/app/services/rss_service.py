@@ -381,8 +381,15 @@ def _is_listing_url(url: str) -> bool:
     try:
         path = urlparse(url).path
         segments = [s for s in path.split("/") if s]
-        if len(segments) <= 1:
-            return True  # homepage ou chemin trop court
+        if len(segments) == 0:
+            return True  # homepage pure
+        if len(segments) == 1:
+            # Un seul segment = article ID numérique (ex: /1174498, /211165.html, /151147/)
+            # Patterns reconnus comme articles : purement numérique, ou numérique + extension
+            import re as _re
+            if _re.match(r'^\d+(\.\w+)?/?$', segments[0]):
+                return False
+            return True  # chemin non-numérique trop court = listing
         return bool(_LISTING_RE.search(path))
     except Exception:
         return False
