@@ -18,6 +18,13 @@ try:
 except ImportError:
     _TRAF_OK = False
 
+# readability-lxml — Firefox Reader Mode algorithm
+try:
+    from readability import Document as _ReadabilityDoc
+    _READABILITY_OK = True
+except ImportError:
+    _READABILITY_OK = False
+
 from app.models.media_source import MediaSource
 from app.models.rss_article import RssArticle
 
@@ -152,11 +159,14 @@ def _newspaper_fetch_sync(url: str) -> dict:
         if article.authors:
             result["author"] = ", ".join(article.authors)[:255]
         if article.publish_date:
-            from datetime import timezone as _tz
+            from datetime import timezone as _tz, timedelta as _td
             pub = article.publish_date
             if pub.tzinfo is None:
                 pub = pub.replace(tzinfo=_tz.utc)
-            result["published_at_fallback"] = pub
+            _now = datetime.now(_tz.utc)
+            # Rejeter dates futures (> 1h) ou trop vieilles (> 2 ans) — corrompues
+            if pub <= _now + _td(hours=1) and pub >= _now - _td(days=730):
+                result["published_at_fallback"] = pub
         if article.top_image:
             result["image_url"] = article.top_image
         return result
@@ -178,8 +188,13 @@ def _traf_fetch_sync(url: str) -> dict:
             html = r.read().decode("utf-8", errors="ignore")
         if not html:
             return {}
-        result: dict = {}
-        content = trafilatura.extract(html, include_comments=False, include_tables=False)
+        result: dict = {"_raw_html": html}  # HTML brut pour Readability/CSS fallback
+        content = trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=False,
+            favor_precision=True,  # coupe sidebar, footer, articles connexes
+        )
         if content:
             result["content"] = content[:60_000]
         meta = _traf_meta(html)
@@ -249,6 +264,85 @@ def _traf_from_html(html: str) -> dict:
         return {}
 
 
+# ── Sélecteurs CSS par domaine (extraction chirurgicale) ──────────────────
+_SITE_SELECTORS: dict[str, str] = {
+    # Maroc — sites arabes
+    "hespress.com":          ".entry-content",
+    "goud.ma":               ".article-body, .td-post-content",
+    "alyaoum24.com":         ".article-body",
+    "hibapress.com":         ".entry-content",
+    "lakome2.com":           ".entry-content",
+    "akhbarona.com":         ".entry-content",
+    "assabah.press.ma":      ".entry-content",
+    "marocorama.com":        ".entry-content",
+    "areion24.ma":           ".entry-content",
+    "akhbarak.net":          ".entry-content",
+    "animarocanews.com":     ".entry-content",
+    # Maroc — sites français
+    "medias24.com":          ".article-body, .story-body",
+    "le360.ma":              ".article-body",
+    "fr.le360.ma":           ".article-body",
+    "h24info.ma":            ".article-body",
+    "telquel.ma":            ".single-article__body",
+    "libe.ma":               ".entry-content",
+    "yabiladi.com":          ".article-body",
+    "medi1.com":             ".article-content",
+    "2m.ma":                 ".field-items, .article-body",
+    "map.ma":                ".field-items",
+}
+
+
+def _css_extract_from_html(html: str, selector: str) -> str:
+    """Extrait le texte d'un élément HTML via sélecteur CSS (lxml + cssselect)."""
+    try:
+        from lxml import etree
+        tree = etree.fromstring(html.encode("utf-8", errors="ignore"), parser=etree.HTMLParser())
+        # Tenter chaque sélecteur séparé par virgule
+        for sel in (s.strip() for s in selector.split(",")):
+            elements = tree.cssselect(sel)
+            if elements:
+                texts = [" ".join(el.itertext()).strip() for el in elements]
+                result = "\n\n".join(t for t in texts if t)
+                if len(result) > 150:
+                    return result
+    except Exception:
+        pass
+    return ""
+
+
+def _readability_from_html_sync(html: str) -> dict:
+    """Extraction via Readability (Firefox Reader Mode) — sur HTML déjà téléchargé."""
+    if not _READABILITY_OK or not html:
+        return {}
+    try:
+        doc = _ReadabilityDoc(html)
+        title = doc.title() or ""
+        summary_html = doc.summary(html_partial=True)
+        # Extraire le texte brut depuis le HTML résumé
+        from lxml import etree
+        tree = etree.fromstring(summary_html.encode("utf-8", errors="ignore"), parser=etree.HTMLParser())
+        content = re.sub(r"\s+", " ", " ".join(tree.itertext())).strip()
+        if len(content) < 150:
+            return {}
+        return {"title": title, "content": content}
+    except Exception:
+        return {}
+
+
+def _validate_content(content: str | None) -> bool:
+    """Valide qu'un contenu extrait est un vrai article (pas une page d'erreur/listing)."""
+    if not content:
+        return False
+    words = len(re.findall(r"[\w\u0600-\u06ff]+", content))
+    if words < 80:
+        return False
+    # Trop de liens = page listing/sidebar
+    url_count = len(re.findall(r"https?://", content))
+    if url_count > 0 and words / url_count < 15:
+        return False
+    return True
+
+
 async def _resolve_google_news_url(url: str) -> str:
     """
     Résout une URL Google News RSS vers l'URL réelle de l'article via Playwright.
@@ -294,13 +388,19 @@ def _is_listing_url(url: str) -> bool:
         return False
 
 
-async def _fetch_via_jina(url: str, timeout: float = 12.0) -> dict:
-    """Extraction via Jina AI Reader — gère JS, Cloudflare, arabe."""
+async def _fetch_via_jina(url: str, timeout: float = 12.0, css_selector: str | None = None) -> dict:
+    """Extraction via Jina AI Reader — gère JS, Cloudflare, arabe.
+    Si css_selector fourni, Jina cible directement cet élément (X-Target-Selector).
+    """
     try:
+        headers = {"Accept": "application/json", "X-Return-Format": "markdown"}
+        if css_selector:
+            # Prendre le premier sélecteur si plusieurs (séparés par virgule)
+            headers["X-Target-Selector"] = css_selector.split(",")[0].strip()
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 f"https://r.jina.ai/{url}",
-                headers={"Accept": "application/json", "X-Return-Format": "markdown"},
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as r:
                 if r.status == 200:
@@ -317,13 +417,12 @@ async def _fetch_via_jina(url: str, timeout: float = 12.0) -> dict:
 
 async def enrich_article(url: str, language: str = "ar") -> dict:
     """
-    Pipeline optimisé 2 tiers :
-    - Tier 1 : Trafilatura (10s timeout strict) — rapide, 0 dépendance externe
-    - Tier 2 : Jina AI Reader si Tier 1 échoue — gère JS/Cloudflare/arabe
-
-    Les pages listing/catégorie sont rejetées avant tout fetch HTTP.
+    Pipeline 4 tiers (sans HTTP supplémentaire entre Tier 1 et Tier 3) :
+    - Tier 1 : Trafilatura (favor_precision, 10s) — rapide, arabe, précis
+    - Tier 2 : CSS selector site-specific (même HTML, 0ms réseau)
+    - Tier 3 : Readability / Firefox Reader Mode (même HTML, 0ms réseau)
+    - Tier 4 : Jina AI Reader (réseau, 12s) — JS/Cloudflare/anti-bot
     """
-    # Résoudre l'URL Google News → URL réelle avant toute extraction
     original_url = url
     if "news.google.com" in url:
         url = await _resolve_google_news_url(url)
@@ -331,14 +430,16 @@ async def enrich_article(url: str, language: str = "ar") -> dict:
     from app.services.scraper_service import _encode_url as _enc
     url = _enc(url)
 
-    # Rejeter les pages listing avant tout HTTP
     if _is_listing_url(url):
         return {"_listing": True}
 
-    loop = asyncio.get_event_loop()
+    domain = urlparse(url).netloc.lower().replace("www.", "")
+    css_selector = _SITE_SELECTORS.get(domain)
 
-    # ── Tier 1 : Trafilatura (10s) ────────────────────────────────────────────
+    loop = asyncio.get_event_loop()
     result: dict = {}
+
+    # ── Tier 1 : Trafilatura (favor_precision) ────────────────────────────────
     try:
         result = await asyncio.wait_for(
             loop.run_in_executor(None, _traf_fetch_sync, url),
@@ -347,9 +448,25 @@ async def enrich_article(url: str, language: str = "ar") -> dict:
     except (asyncio.TimeoutError, Exception):
         result = {}
 
-    # ── Tier 2 : Jina fallback si contenu absent ──────────────────────────────
-    if not result.get("content") or len(result.get("content", "")) < 100:
-        jina = await _fetch_via_jina(url)
+    raw_html: str | None = result.pop("_raw_html", None)
+
+    # ── Tier 2 : CSS selector (même HTML, si Traf insuffisant) ───────────────
+    if raw_html and css_selector and not _validate_content(result.get("content")):
+        css_text = await loop.run_in_executor(None, _css_extract_from_html, raw_html, css_selector)
+        if css_text and _validate_content(css_text):
+            result["content"] = css_text
+
+    # ── Tier 3 : Readability (même HTML, Firefox Reader Mode) ────────────────
+    if raw_html and not _validate_content(result.get("content")):
+        readability = await loop.run_in_executor(None, _readability_from_html_sync, raw_html)
+        if readability.get("content") and _validate_content(readability["content"]):
+            result["content"] = readability["content"]
+            if not result.get("title") and readability.get("title"):
+                result["title"] = readability["title"]
+
+    # ── Tier 4 : Jina (réseau, seulement si tout a échoué) ───────────────────
+    if not _validate_content(result.get("content")):
+        jina = await _fetch_via_jina(url, css_selector=css_selector)
         if jina.get("title") and not result.get("title"):
             result["title"] = jina["title"]
         if jina.get("content"):
@@ -1344,9 +1461,10 @@ async def crawl_source_by_id(source_id, db: AsyncSession) -> dict:
 
 
 _NOISE_PATTERNS = re.compile(
-    r'(?:lire aussi|voir aussi|à lire aussi|sur le même sujet'
-    r'|اقرأ أيضاً?|اقرأ ايضا|انظر أيضاً?'
-    r'|related articles?|you may also like)[^\n]*',
+    r'(?:lire aussi|voir aussi|à lire aussi|sur le même sujet|articles? (liés?|connexes?)'
+    r'|اقرأ أيضاً?|اقرأ ايضا|انظر أيضاً?|مقالات ذات صلة|مواضيع ذات صلة|شاهد أيضاً?'
+    r'|related articles?|you may also like|more from|read more|continue reading'
+    r'|tribune[s]? libre[s]?|خبر ذو صلة)',
     re.IGNORECASE,
 )
 
@@ -1360,14 +1478,28 @@ def _is_date_only(dt) -> bool:
 
 
 def _clean_content(text: str) -> str:
-    """Supprime les sections parasites (Lire aussi, اقرأ أيضاً, etc.)."""
+    """Nettoie le contenu extrait : supprime sections parasites, lignes courtes, bruit."""
     if not text:
         return text
-    # Tronquer dès le premier bloc "Lire aussi"
+
+    # 1. Tronquer dès le premier bloc "Lire aussi / اقرأ أيضاً / ..."
     m = _NOISE_PATTERNS.search(text)
     if m:
         text = text[:m.start()].strip()
-    return text
+
+    # 2. Supprimer les lignes trop courtes (< 20 chars) = navigation, labels, séparateurs
+    lines = text.split("\n")
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or len(stripped) >= 20:
+            cleaned.append(line)
+    text = "\n".join(cleaned)
+
+    # 3. Réduire les lignes vides multiples
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
 
 
 # Fix C — Backoff exponentiel pour les retries (6 tentatives sur 24h)
@@ -1490,6 +1622,23 @@ async def enrich_pending_batch(db: AsyncSession, batch_size: int = 5) -> dict:
                 # Texte complet nettoyé
                 if enrichment.get("content"):
                     art.content = _clean_content(enrichment["content"])[:60_000]
+
+                # Contenu trop court = extraction partielle (titre HTML sans corps)
+                # → ne pas marquer extracted, retenter via backoff
+                _content_len = len((art.content or "").strip())
+                if _content_len < 150:
+                    retry_count = (art.retry_count or 0) + 1
+                    art.retry_count = retry_count
+                    if retry_count < _MAX_RETRIES:
+                        art.status = "failed"
+                        art.extraction_error = "no_content"
+                        art.retry_after = datetime.now(timezone.utc) + _RETRY_DELAYS[retry_count - 1]
+                    else:
+                        art.status = "failed"
+                        art.extraction_error = "no_content_final"
+                        art.retry_after = None
+                    art.enriched_at = datetime.now(timezone.utc)
+                    return
 
                 # Image — l'extracteur a priorité, sinon on garde le fallback RSS
                 if enrichment.get("image_url"):
@@ -1656,6 +1805,68 @@ async def purge_old_articles(db: AsyncSession, days: int = 30) -> dict:
     return {
         "no_match_deleted": r1.rowcount,
         "failed_deleted": r2.rowcount,
+    }
+
+
+async def reset_empty_content_articles(db: AsyncSession, days: int = 30) -> dict:
+    """
+    Reset rétroactif : articles bloqués en no_match ou extracted avec contenu vide/trop court.
+    Ces articles ont été traités avant le fix du check longueur contenu (<150 chars).
+    On les remet en pending pour qu'ils soient re-extraits puis re-matchés.
+    """
+    from sqlalchemy import update, or_, and_, func as sqlfunc
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    # Articles no_match avec contenu vide ou trop court (< 150 chars)
+    r1 = await db.execute(
+        update(RssArticle)
+        .where(
+            and_(
+                RssArticle.status == "no_match",
+                RssArticle.collected_at >= cutoff,
+                or_(
+                    RssArticle.content.is_(None),
+                    sqlfunc.length(RssArticle.content) < 150,
+                ),
+            )
+        )
+        .values(
+            status="pending",
+            matched_at=None,
+            enriched_at=None,
+            retry_count=0,
+            retry_after=None,
+            extraction_error=None,
+        )
+    )
+
+    # Articles extracted avec contenu vide ou trop court (jamais matchés correctement)
+    r2 = await db.execute(
+        update(RssArticle)
+        .where(
+            and_(
+                RssArticle.status == "extracted",
+                RssArticle.matched_at.is_(None),
+                RssArticle.collected_at >= cutoff,
+                or_(
+                    RssArticle.content.is_(None),
+                    sqlfunc.length(RssArticle.content) < 150,
+                ),
+            )
+        )
+        .values(
+            status="pending",
+            enriched_at=None,
+            retry_count=0,
+            retry_after=None,
+            extraction_error=None,
+        )
+    )
+
+    await db.commit()
+    return {
+        "no_match_reset": r1.rowcount,
+        "extracted_reset": r2.rowcount,
     }
 
 

@@ -903,6 +903,18 @@ async def flaresolverr_status():
     }
 
 
+@router.post("/maintenance/reset-empty-content")
+async def reset_empty_content(days: int = 30, db: AsyncSession = Depends(get_db)):
+    """
+    Reset rétroactif : remet en pending les articles no_match/extracted avec contenu
+    vide ou trop court (<150 chars) pour qu'ils soient re-extraits et re-matchés.
+    Utile pour récupérer les articles bloqués avant le fix de validation de contenu.
+    """
+    from app.services.rss_service import reset_empty_content_articles
+    result = await reset_empty_content_articles(db, days=days)
+    return result
+
+
 @router.get("/discover/gdelt")
 async def discover_sources_gdelt(
     query: str = "Maroc OR Morocco OR المغرب",
