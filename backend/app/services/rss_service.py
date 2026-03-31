@@ -382,6 +382,14 @@ def _is_listing_url(url: str) -> bool:
         path = urlparse(url).path
         segments = [s for s in path.split("/") if s]
         if len(segments) == 0:
+            # Vérifier les query params WordPress (?p=ID, ?page_id=ID, ?article=ID)
+            import re as _re
+            from urllib.parse import parse_qs as _pqs, urlparse as _up2
+            qs = _pqs(_up2(url).query)
+            for key in ("p", "page_id", "article", "post", "id"):
+                val = qs.get(key, [""])[0]
+                if _re.match(r'^\d+$', val):
+                    return False  # WordPress ?p=ID → article
             return True  # homepage pure
         if len(segments) == 1:
             # Un seul segment — patterns d'articles reconnus :
